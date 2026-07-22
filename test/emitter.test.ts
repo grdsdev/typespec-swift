@@ -204,6 +204,51 @@ describe("doc-comments fixture", () => {
   }, 120_000);
 });
 
+describe("multipart fixture", () => {
+  it("flattens parts into parameters, builds multipart bodies, and builds", async () => {
+    const outputDir = await compileFixture("multipart");
+    const client = readFileSync(join(outputDir, "MultipartServiceClient.swift"), "utf8");
+
+    // uploadProfile: plain + multi + file part with dynamic filename/contentType.
+    expect(client).toContain(
+      "public func uploadProfile(name: String, tags: [String], avatar: HTTPBody, avatarFilename: String? = nil, avatarContentType: String? = nil, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
+    );
+    expect(client).toContain('multipart.append(.init(name: "name", source: .data(Data(name.utf8))))');
+    expect(client).toContain("for value in tags {");
+    expect(client).toContain('multipart.append(.init(name: "tags", source: .data(Data(value.utf8))))');
+    expect(client).toContain(
+      'multipart.append(.init(name: "avatar", filename: avatarFilename, contentType: avatarContentType, source: avatar))'
+    );
+    expect(client).toContain('builder.setHeader("Content-Type", multipart.contentType)');
+    expect(client).toContain("let multipartFile = try multipart.writeToTemporaryFile()");
+    expect(client).toContain("defer { try? FileManager.default.removeItem(at: multipartFile) }");
+    expect(client).toContain("builder.setBody(.file(multipartFile))");
+    expect(client).toContain(
+      "let response = try await transport.send(builder.build(), uploadProgress: uploadProgress)"
+    );
+
+    // uploadRaw: bare HttpPart<bytes>, static single content type literal.
+    expect(client).toContain(
+      "public func uploadRaw(raw: HTTPBody, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
+    );
+    expect(client).toContain(
+      'multipart.append(.init(name: "raw", filename: nil, contentType: "application/octet-stream", source: raw))'
+    );
+
+    // uploadMetadata: plain parts only (one optional) -> in-memory encode(), no uploadProgress.
+    expect(client).toContain(
+      "public func uploadMetadata(name: String, description: String? = nil) async throws -> UploadResult {"
+    );
+    expect(client).toContain("if let description {");
+    expect(client).toContain('multipart.append(.init(name: "description", source: .data(Data(description.utf8))))');
+    expect(client).toContain("builder.setBody(.data(try multipart.encode()))");
+    expect(client).not.toContain("uploadMetadata(name: String, description: String? = nil, uploadProgress");
+
+    const { stdout } = buildGeneratedSwift(outputDir);
+    expect(stdout).toBeDefined();
+  }, 120_000);
+});
+
 describe("keywords fixture", () => {
   it("escapes reserved Swift keyword members and uses dual-name init params, and builds", async () => {
     const outputDir = await compileFixture("keywords");
