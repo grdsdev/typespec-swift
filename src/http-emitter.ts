@@ -49,18 +49,21 @@ function stringValueExpr(p: ParamInfo): string {
 interface PartInfo {
   /** Wire/part name, also used as the base Swift parameter name. */
   name: string;
-  /** Swift type of a single element (before any `[]` wrapping for `multi`). */
+  /** Swift type of a single element (before any `[]` wrapping for `multi`):
+   * `"HTTPFile"` for binary parts, otherwise the part's native Swift type. */
   baseSwiftType: string;
   /** Full parameter Swift type, including `[]` wrapping when `multi`. */
   swiftType: string;
   required: boolean;
   multi: boolean;
   /** True for `Http.File`-derived parts and bare `HttpPart<bytes>` parts —
-   * both get a flattened `HTTPBody` parameter instead of their raw type. */
+   * both get an `HTTPFile` parameter instead of their raw type. */
   isBinary: boolean;
-  filenameParam?: { name: string; required: boolean };
-  contentTypeParam?: { name: string; required: boolean };
-  contentTypeLiteral?: string;
+  /** Fallback passed to `HTTPFile.resolvedContentType(fallback:)` when the
+   * spec has no dynamic content-type property but does declare a single
+   * static content type (the bare `HttpPart<bytes>` case). Undefined when a
+   * dynamic property exists (no fallback needed) or neither is present. */
+  contentTypeFallback?: string;
   docNode?: any;
 }
 
@@ -68,7 +71,7 @@ function buildMultipartParts(program: any, body: any): PartInfo[] {
   return body.parts.map((part: any): PartInfo => {
     const elementType = swiftTypeForType(part.body.type, program);
     const isBinary = part.body.bodyKind === "file" || elementType === "Data";
-    const baseSwiftType = isBinary ? "HTTPBody" : elementType;
+    const baseSwiftType = isBinary ? "HTTPFile" : elementType;
     const swiftType = part.multi ? `[${baseSwiftType}]` : baseSwiftType;
     const info: PartInfo = {
       name: part.name,
@@ -79,18 +82,8 @@ function buildMultipartParts(program: any, body: any): PartInfo[] {
       isBinary,
       docNode: part.property,
     };
-    if (isBinary) {
-      if (part.filename) {
-        info.filenameParam = { name: `${part.name}Filename`, required: !part.filename.optional };
-      }
-      if (part.body.contentTypeProperty) {
-        info.contentTypeParam = {
-          name: `${part.name}ContentType`,
-          required: !part.body.contentTypeProperty.optional,
-        };
-      } else if (part.body.contentTypes?.length === 1) {
-        info.contentTypeLiteral = part.body.contentTypes[0];
-      }
+    if (isBinary && !part.body.contentTypeProperty && part.body.contentTypes?.length === 1) {
+      info.contentTypeFallback = part.body.contentTypes[0];
     }
     return info;
   });
@@ -115,10 +108,12 @@ function partValueToDataExpr(baseType: string, expr: string): string {
   }
 }
 
-function contentTypeExpr(p: PartInfo): string {
-  if (p.contentTypeParam) return escapeIdentifier(p.contentTypeParam.name);
-  if (p.contentTypeLiteral) return JSON.stringify(p.contentTypeLiteral);
-  return "nil";
+// Builds the `HTTPFile.resolvedContentType(...)` call expression for a
+// binary part value expression (e.g. a parameter name or a loop variable).
+function resolvedContentTypeExpr(p: PartInfo, valueExpr: string): string {
+  return p.contentTypeFallback
+    ? `${valueExpr}.resolvedContentType(fallback: ${JSON.stringify(p.contentTypeFallback)})`
+    : `${valueExpr}.resolvedContentType()`;
 }
 
 // Emits the `multipart.append(...)` statement(s) for one part, handling the
@@ -131,18 +126,9 @@ function emitPartAppend(p: PartInfo): string {
   if (p.multi) {
     const iterExpr = p.required ? label : `${label} ?? []`;
     if (p.isBinary) {
-      if (p.filenameParam) {
-        const filenameLabel = escapeIdentifier(p.filenameParam.name);
-        const filenameIter = p.filenameParam.required ? filenameLabel : `${filenameLabel} ?? []`;
-        return (
-          `        for (value, filename) in zip(${iterExpr}, ${filenameIter}) {\n` +
-          `            multipart.append(.init(name: ${wire}, filename: filename, contentType: ${contentTypeExpr(p)}, source: value))\n` +
-          `        }\n`
-        );
-      }
       return (
         `        for value in ${iterExpr} {\n` +
-        `            multipart.append(.init(name: ${wire}, contentType: ${contentTypeExpr(p)}, source: value))\n` +
+        `            multipart.append(.init(name: ${wire}, filename: value.resolvedFilename(), contentType: ${resolvedContentTypeExpr(p, "value")}, source: value.asHTTPBody()))\n` +
         `        }\n`
       );
     }
@@ -154,8 +140,7 @@ function emitPartAppend(p: PartInfo): string {
   }
 
   if (p.isBinary) {
-    const filenameExpr = p.filenameParam ? escapeIdentifier(p.filenameParam.name) : "nil";
-    const append = `multipart.append(.init(name: ${wire}, filename: ${filenameExpr}, contentType: ${contentTypeExpr(p)}, source: ${label}))\n`;
+    const append = `multipart.append(.init(name: ${wire}, filename: ${label}.resolvedFilename(), contentType: ${resolvedContentTypeExpr(p, label)}, source: ${label}.asHTTPBody()))\n`;
     if (p.required) return `        ${append}`;
     return `        if let ${label} {\n            ${append}        }\n`;
   }
@@ -268,16 +253,6 @@ function emitOperation(program: any, httpOp: any, modifier: string): string {
   } else if (requestBodyKind === "multipart") {
     for (const p of multipartParts) {
       params.push(`${escapeIdentifier(p.name)}: ${p.swiftType}${p.required ? "" : "?"}${p.required ? "" : " = nil"}`);
-      if (p.filenameParam) {
-        const fp = p.filenameParam;
-        const fpType = p.multi ? "[String]" : "String";
-        params.push(`${escapeIdentifier(fp.name)}: ${fpType}${fp.required ? "" : "?"}${fp.required ? "" : " = nil"}`);
-      }
-      if (p.contentTypeParam) {
-        const cp = p.contentTypeParam;
-        const cpType = p.multi ? "[String]" : "String";
-        params.push(`${escapeIdentifier(cp.name)}: ${cpType}${cp.required ? "" : "?"}${cp.required ? "" : " = nil"}`);
-      }
     }
     if (multipartHasFilePart) {
       params.push(`uploadProgress: ProgressHandler? = nil`);
