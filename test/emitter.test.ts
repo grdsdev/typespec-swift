@@ -209,15 +209,15 @@ describe("multipart fixture", () => {
     const outputDir = await compileFixture("multipart");
     const client = readFileSync(join(outputDir, "MultipartServiceClient.swift"), "utf8");
 
-    // uploadProfile: plain + multi + file part with dynamic filename/contentType.
+    // uploadProfile: plain + multi + file part bundled into HTTPFile.
     expect(client).toContain(
-      "public func uploadProfile(name: String, tags: [String], avatar: HTTPBody, avatarFilename: String? = nil, avatarContentType: String? = nil, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
+      "public func uploadProfile(name: String, tags: [String], avatar: HTTPFile, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
     );
     expect(client).toContain('multipart.append(.init(name: "name", source: .data(Data(name.utf8))))');
     expect(client).toContain("for value in tags {");
     expect(client).toContain('multipart.append(.init(name: "tags", source: .data(Data(value.utf8))))');
     expect(client).toContain(
-      'multipart.append(.init(name: "avatar", filename: avatarFilename, contentType: avatarContentType, source: avatar))'
+      'multipart.append(.init(name: "avatar", filename: avatar.resolvedFilename(), contentType: avatar.resolvedContentType(), source: avatar.asHTTPBody()))'
     );
     expect(client).toContain('builder.setHeader("Content-Type", multipart.contentType)');
     expect(client).toContain("let multipartFile = try multipart.writeToTemporaryFile()");
@@ -227,12 +227,12 @@ describe("multipart fixture", () => {
       "let response = try await transport.send(builder.build(), uploadProgress: uploadProgress)"
     );
 
-    // uploadRaw: bare HttpPart<bytes>, static single content type literal.
+    // uploadRaw: bare HttpPart<bytes>, static single content type as fallback.
     expect(client).toContain(
-      "public func uploadRaw(raw: HTTPBody, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
+      "public func uploadRaw(raw: HTTPFile, uploadProgress: ProgressHandler? = nil) async throws -> UploadResult {"
     );
     expect(client).toContain(
-      'multipart.append(.init(name: "raw", filename: nil, contentType: "application/octet-stream", source: raw))'
+      'multipart.append(.init(name: "raw", filename: raw.resolvedFilename(), contentType: raw.resolvedContentType(fallback: "application/octet-stream"), source: raw.asHTTPBody()))'
     );
 
     // uploadMetadata: plain parts only (one optional) -> in-memory encode(), no uploadProgress.
